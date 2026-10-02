@@ -67,6 +67,24 @@ public static class LyricifyOverflowHook
         {
             if (value == null || value.Length < 20)
                 return value;
+            // YesPlayMusic /player response: {"currentTrack":{...},"progress":N,"playing":bool}
+            // When paused, report progress creeping forward at 0.02 s/s from the paused
+            // position: monotonic (no backward jumps -> no flicker), keeps Lyricify's
+            // "value unchanged -> poll less" heuristic from sleeping, and re-anchors
+            // the lyric timeline to essentially the paused line every second.
+            if (value[0] == '{' && value.IndexOf("\"playing\":false") >= 0 && value.IndexOf("\"currentTrack\"") >= 0)
+            {
+                double cur = ExtractProgress(value);
+                long track = ExtractTrackId(value);
+                if (_creepTrack != track || _creepBase < 0 || cur > _creepNow + 1.0)
+                {
+                    _creepTrack = track;
+                    _creepBase = cur;
+                    _creepNow = cur;
+                }
+                _creepNow += 0.02;
+                return ReplaceProgress(value, _creepNow.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+            }
             bool shaped = value.IndexOf("\"lrc\"") >= 0 || value.IndexOf("\"nolyric\"") >= 0 || value.IndexOf("\"sgc\"") >= 0;
             if (!shaped)
                 return value;
@@ -107,7 +125,106 @@ public static class LyricifyOverflowHook
         }
     }
 
+    private static int _pausedRewriteLeft = 3;
     private static int _diagLeft = 5;
+
+    private static double _creepBase = -1;
+    private static double _creepNow = -1;
+    private static long _creepTrack = -1;
+
+    private static double ExtractProgress(string value)
+    {
+        int i = value.IndexOf("\"progress\"");
+        if (i < 0) return -1;
+        int c = value.IndexOf(':', i + 10);
+        int s = c + 1;
+        while (s < value.Length && value[s] == ' ') s++;
+        int e = s;
+        while (e < value.Length && (char.IsDigit(value[e]) || value[e] == '.' || value[e] == '-')) e++;
+        double v;
+        double.TryParse(value.Substring(s, e - s), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out v);
+        return v;
+    }
+
+    private static long ExtractTrackId(string value)
+    {
+        int ct = value.IndexOf("\"currentTrack\"");
+        if (ct < 0) return -1;
+        int ar = value.IndexOf("\"ar\"", ct);
+        string seg = ar > ct ? value.Substring(ct, ar - ct) : value.Substring(ct);
+        System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(seg, "\\\"id\\\"\\s*:\\s*(-?\\d+)");
+        long v;
+        return m.Success && long.TryParse(m.Groups[1].Value, out v) ? v : -1;
+    }
+
+    private static string ReplaceProgress(string value, string text)
+    {
+        int i = value.IndexOf("\"progress\"");
+        if (i < 0) return value;
+        int c = value.IndexOf(':', i + 10);
+        int s = c + 1;
+        while (s < value.Length && value[s] == ' ') s++;
+        int e = s;
+        while (e < value.Length && (char.IsDigit(value[e]) || value[e] == '.' || value[e] == '-')) e++;
+        if (e == s) return value;
+        return value.Substring(0, s) + text + value.Substring(e);
+    }
+
+    // Rewrites "progress" to the track duration (+1s) so Lyricify treats the
+    // track as finished and stops advancing the lyric timeline.
+    private static string PinProgressToDuration(string value)
+    {
+        int i = value.IndexOf("\"dt\"");
+        double durationMs = -1;
+        if (i > 0)
+        {
+            int d = value.IndexOf(':', i + 4);
+            int s = d + 1;
+            int e = s;
+            while (e < value.Length && (char.IsDigit(value[e])))
+                e++;
+            double.TryParse(value.Substring(s, e - s), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out durationMs);
+        }
+        string target = durationMs > 0
+            ? ((durationMs / 1000.0) + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : "99999";
+        i = value.IndexOf("\"progress\"");
+        if (i < 0)
+            return value;
+        int c = value.IndexOf(':', i + 10);
+        int s2 = c + 1;
+        while (s2 < value.Length && value[s2] == ' ')
+            s2++;
+        int e2 = s2;
+        while (e2 < value.Length && (char.IsDigit(value[e2]) || value[e2] == '.' || value[e2] == '-'))
+            e2++;
+        if (e2 == s2)
+            return value;
+        return value.Substring(0, s2) + target + value.Substring(e2);
+    }
+
+    // Rewrites "progress":<number> to 0 in the /player JSON.
+    private static string ZeroProgress(string value)
+    {
+        int i = value.IndexOf("\"progress\"");
+        if (i < 0)
+            return value;
+        int d = value.IndexOf(':', i + 10);
+        if (d < 0)
+            return value;
+        int s = d + 1;
+        while (s < value.Length && (value[s] == ' '))
+            s++;
+        int e = s;
+        while (e < value.Length && (char.IsDigit(value[e]) || value[e] == '.' || value[e] == '-' || value[e] == '+' || value[e] == 'e' || value[e] == 'E'))
+            e++;
+        if (e == s)
+            return value;
+        return value.Substring(0, s) + "0" + value.Substring(e);
+    }
+
     private static long _lastRepairedId;
     private static string _lastRepairedJson;
 

@@ -45,6 +45,38 @@ Lyricify 内部的 YesPlayMusic 曲目模型 `Track.Id` 字段是 **32 位 int**
 
 运行 `scripts/rollback.bat`，或手动：还原原始 `Newtonsoft.Json.dll`（备份在 `bin/orig-backup.md` 说明中）、删除 `HookTemplate.dll`、移除 config 里的 bindingRedirect。
 
+## 修复二：暂停时歌词不停 / Fix 2: lyrics keep scrolling while paused
+
+### 现象
+
+YesPlayMusic 暂停后，Lyricify 的歌词继续往下滚，直到恢复播放才跳回正确位置。
+
+### 根因
+
+YesPlayMusic 的 `/player` 接口只返回 `{currentTrack, progress}`，**没有播放状态字段**；暂停时 `progress` 冻结。Lyricify 判定"progress 没变"后只是降低轮询频率，但歌词滚动器继续按旧速度推进本地时钟，于是歌词漂移。
+
+### 修复（两部分，需同时安装）
+
+**1. fork 侧（app.asar）**：`/player` 应答增加 `playing: e._playing` 字段，暴露真实播放状态。
+   - 自动打补丁：`npm install @electron/asar` 后运行 `scripts/patch-yesplaymusic-asar.mjs "<你的 YesPlayMusic>\resources\app.asar"`，得到 `app.asar.patched`；**先备份原 app.asar**，再用管理员权限覆盖（Program Files 需要提权）。
+   - 该 fork 上游已删库；上游 qier222/YesPlayMusic 主线同样只有 `progress`，此补丁同样适用。
+
+**2. Lyricify 侧（HookTemplate.dll）**：检测 `/player` 应答中的 `"playing":false`，把 `progress` 改写为从暂停点起以 **0.02 秒/秒** 单调缓涨的值：
+   - 单调递增 → 滚动器无倒退/跳变 → 无闪烁
+   - 值持续微变 → 轮询判定不降频 → 每秒重锚 → 歌词钉在暂停的那一句（10 分钟暂停只"前进"12 秒）
+   - 恢复播放 → 真实 progress 超过缓涨值 1 秒即重置回真实位置
+
+这是在"Lyricify 3 已 EOL + 滚动器逻辑被 .NET Reactor 加密无法修改"约束下的近似方案：不是真暂停，但视觉上歌词停住、无闪动、恢复无跳变。试过的其他策略及失败原因见下表：
+
+| 策略 | 结果 |
+|---|---|
+| progress 清零 | 跳回开头继续滚（锚定到 0 后继续） |
+| progress 钉到曲尾 | 停在曲尾（位置错误） |
+| progress 冻结 | 轮询降频，歌词继续漂移后偶尔弹回 |
+| 冻结 + ±0.001 抖动 | 停在当前句但每秒闪动（已废弃） |
+| **缓涨 0.02 s/s（采用）** | **停在当前句，无闪动** |
+| SMTC 媒体会话 | Lyricify 的 is_use_media_session 只用于注册自己，不读取其他应用会话，无效 |
+
 ### 原理（给想改代码的人）
 
 - `src/Patcher.cs`：用 [dnlib](https://github.com/0xd4d/dnlib) 对原始 `Newtonsoft.Json.dll`（13.0.0.x）打 5 个 IL 补丁：
@@ -71,7 +103,8 @@ Lyricify 内部的 YesPlayMusic 曲目模型 `Track.Id` 字段是 **32 位 int**
 
 - 本仓库代码：MIT
 - 补丁修改的 Newtonsoft.Json：MIT，见 `licenses/LICENSE-Newtonsoft.txt`（MIT 允许修改和再分发）
-- 不分发、不修改 Lyricify / YesPlayMusic 本体
+- YesPlayMusic 的 app.asar 补丁由用户本机用 `scripts/patch-yesplaymusic-asar.mjs` 现场生成，本仓库不分发修改后的 YesPlayMusic 产物
+- 不分发、不修改 Lyricify 本体
 
 ---
 
@@ -81,9 +114,12 @@ Lyricify 内部的 YesPlayMusic 曲目模型 `Track.Id` 字段是 **32 位 int**
 
 ### What is this
 
-A fix for Lyricify 3.8.8 (an EOL desktop-lyrics app) failing to show lyrics for **post-2023 NetEase Cloud Music songs** when used together with [YesPlayMusic](https://github.com/qier222/YesPlayMusic): it either shows nothing or "暂无歌词" (no lyrics available).
+Two fixes for Lyricify 3.8.8 (an EOL desktop-lyrics app) used together with [YesPlayMusic](https://github.com/qier222/YesPlayMusic):
 
-No files of Lyricify or YesPlayMusic are modified — only 2 DLLs in the Lyricify folder are replaced/added, plus one config section.
+1. **No lyrics for post-2023 songs** — int32 song-id overflow + placeholder-lyric response repair
+2. **Lyrics keep scrolling while paused** — the fork's `/player` API lacks a playing flag; patched to expose it, plus a monotonic progress-creep rewrite that pins lyrics to the paused line
+
+See the 中文 section above for full details (root causes, install steps, strategy comparison table for the pause fix, and rebuild instructions). Install steps in short: replace/add the two DLLs from `bin/` into the Lyricify folder, add the bindingRedirect shown above to `Lyricify.exe.config`, and (for the pause fix) run `scripts/patch-yesplaymusic-asar.mjs` against YesPlayMusic's `app.asar` after backing it up.
 
 ### Root cause
 
